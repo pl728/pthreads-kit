@@ -83,7 +83,7 @@ int Queue_pop(Queue* q, void** out) {
         pthread_cond_wait(&q->not_empty, &q->mutex);
     }
 
-    if(q->shutdown_flag) {
+    if(q->shutdown_flag && q->count == 0) {
         pthread_mutex_unlock(&q->mutex);
         return -1;
     }
