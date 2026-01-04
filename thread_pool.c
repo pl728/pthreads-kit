@@ -109,6 +109,14 @@ void Pool_shutdown(Pool* pool) {
     for(size_t i = 0; i < pool->pool_size; i++) {
         pthread_join(pool->workers[i], NULL);
     }
+
+    if (pool->shutdown_mode == POOL_SHUTDOWN_IMMEDIATE) {
+        void* item;
+        while (Queue_pop(pool->queue, &item) == 0) {
+            Task* t = (Task*)item;
+            free(t);
+        }
+    }
 }
 
 // destructor
