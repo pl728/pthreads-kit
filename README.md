@@ -1,4 +1,8 @@
-### Preliminary Summary
+# Pthreads Kit in C
+This project implements a thread pool in C, built to understand concurrency primitives & producer/consumer patterns. The project consists of a bounded blocking queue using pthread mutexes and condition variables (Part A), and a fixed-size thread pool that uses the queue to distribute work across worker threads (Part B).
+
+## Blocking Queue - Part A
+### Design Considerations
 
 **Organization:**
 We're using the opaque struct pattern with `.h` and `.c` files. The header declares `typedef struct Q Q` so the struct internals stay hidden.
@@ -29,7 +33,7 @@ The `shutdown()` function should "unblock all waiting threads." At first, this i
 
 Because we're using `pthread_cond_t`, we need `shutdown()` to call `pthread_cond_broadcast()` to wake up ALL waiting threads. Then those threads can continue and join.
 
-## Blocking Queue Design
+### Blocking Queue Design
 ### API
 ```c
 // blocking_queue.h
@@ -61,7 +65,7 @@ From the specification, we know that a call to Queue_pop could be in one of thre
 
 `Queue_new()` and `Queue_free()` are part of the opaque struct pattern. In this pattern, a user cannot manually allocate the struct, since it isn't defined in the header file. Thus, the caller is forced to call constructor and destructor.
 
-## Invariants
+### Invariants
 - Queue capacity is fixed at initialization
 - When `count == capacity`, `push()` blocks until `count < capacity`
 - After successful `push()`, `count` increases by 1 and returns `0`
@@ -73,8 +77,59 @@ From the specification, we know that a call to Queue_pop could be in one of thre
 - `count == capacity` implies queue is full
 - `mutex` is held when accessing/modifying any Queue state (`head`, `tail`, `count`, `items[]`, `shutdown_flag`)
 
-## Shutdown Behavior
+### Shutdown Behavior
 - `shutdown()` sets `shutdown_flag = 1` and broadcasts to both condition variables `not_empty`, `not_full`
 - This causes all blocked threads, either in `push()` or `pop()`, to unblock and wake up
 - Immediately after wake, threads check the `shutdown_flag` field, which is now `1` and returns `-1`
 - Remaining items in queue are discarded after `shutdown()` is called
+
+## Thread Pool - Part B
+### Design Considerations
+**Organization:** `ThreadPool` uses opaque struct pattern (`.h`/`.c`). The struct contains a pointer to the `Queue` from Part A, a `POOL_SIZE` variable (or constant), and a shutdown behavior flag for graceful (`0`) vs immediate (`1`) termination.
+
+**Semaphore Consideration:** Initially considered using semaphores to track available threads (initialized to `POOL_SIZE`), but decided against it in favor of a more elegant solution without them.
+
+**Worker Thread Initialization:** At startup, call `pthread_create()` on an array of `pthread_t[POOL_SIZE]`. Each worker thread runs a worker function that continuously calls `Queue_pop()` in a loop until shutdown occurs. The worker threads block on `Queue_pop()` when the queue is empty, waiting for tasks.
+
+**Task Submission Pattern:** To submit work with (function pointer, argument) while fitting the Queue's `void*` requirement, create a task struct containing both the function pointer and its arguments. Push a pointer to this struct onto the queue. When worker threads pop items from the Queue, they extract the function pointer and arguments from the struct, then execute the function with those arguments.
+
+**Shutdown Behavior:** Part A's blocking queue currently shuts down immediately, but Part B requires configurable shutdown. Add a shutdown behavior flag to the threadpool struct. For graceful shutdown (`0`), worker threads continue processing until the queue is empty (`Queue_pop()` won't return `-1` until empty). For immediate shutdown (`1`), worker threads return early. The confusion is whether this flag belongs in the `Queue` struct (Part A) or `ThreadPool` struct (Part B), but it seems it should be in `ThreadPool` to control worker thread behavior.
+
+**Key Insight:** The "add task" operation should be a `ThreadPool` function (like `ThreadPool_submit()`) that creates the task struct and pushes it to the underlying `Queue`. Workers naturally pull tasks by continuously popping from the queue in their worker function loop.
+
+### API
+```c
+// thread_pool.h
+
+typedef struct Pool Pool;
+
+typedef enum {
+    POOL_SHUTDOWN_GRACEFUL = 0,
+    POOL_SHUTDOWN_IMMEDIATE = 1,
+} PoolShutdownMode;
+
+// constructor
+Pool* Pool_new(size_t pool_size, size_t queue_capacity, PoolShutdownMode shutdown_mode);
+
+int Pool_submit(Pool* pool, void (*function)(void*), void* arg);
+
+void Pool_shutdown(Pool* pool);
+
+// destructor
+void Pool_free(Pool* pool);
+
+```
+
+### Implementation Notes
+This API uses the opaque struct pattern. We define a PoolShutdownMode to allow the caller to configure the shutdown behavior to either `POOL_SHUTDOWN_GRACEFUL` or `POOL_SHUTDOWN_IMMEDIATE`. To submit work to the Pool, pass in the pool, a function pointer and a pointer to arg(s). To submit multiple args, package together as a struct, and pass pointer to the arg struct to the function. To shutdown the pool, call `Pool_shutdown()` which internally calls `Queue_shutdown()` on the Pool's Queue. Finally, call `Pool_free()` on cleanup.
+
+### Invariants
+- Pool is created with a fixed number of `pool_size` threads at initialization and cannot be changed afterwards.
+- Threads run until Pool is shutdown.
+- Each submitted task executes exactly once (no duplication, no loss before shutdown)
+- `Pool_submit()` after `Pool_shutdown()` returns `-1` and rejects the task
+- Graceful shutdown - workers continue until queue is empty, then exits
+- Immediate shutdown - workers stop immediately, drains queue, then exits
+- After `Pool_shutdown()` returns, all worker threads have exited
+- `Pool_free()` deallocates pool resources
+- No guarantees regarding work execution order when `pool_size > 1`
